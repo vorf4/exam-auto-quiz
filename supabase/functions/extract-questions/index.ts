@@ -6,6 +6,106 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Helper function to extract text using Gemini OCR
+async function extractWithGemini(base64: string, mimeType: string, lovableApiKey: string): Promise<string> {
+  const ocrResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${lovableApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'google/gemini-2.5-flash',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are an OCR expert. Extract ALL text from the provided image or PDF document. Preserve the exact formatting, structure, and order of the text. Include question numbers, options, and any other visible text.'
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:${mimeType};base64,${base64}`
+              }
+            },
+            {
+              type: 'text',
+              text: 'Extract all text from this document using OCR. Maintain the original structure and formatting.'
+            }
+          ]
+        }
+      ],
+    }),
+  });
+
+  if (!ocrResponse.ok) {
+    const errorText = await ocrResponse.text();
+    console.error('Gemini OCR error:', ocrResponse.status, errorText);
+    throw new Error(`Gemini OCR failed: ${errorText}`);
+  }
+
+  const ocrData = await ocrResponse.json();
+  return ocrData.choices[0].message.content;
+}
+
+// Helper function to process PDF with Filestack OCR
+async function processPdfWithFilestack(base64Data: string, ocrApiKey: string): Promise<string> {
+  console.log('Processing PDF with Filestack OCR...');
+  
+  // Convert base64 to Uint8Array
+  const binaryString = atob(base64Data);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  
+  // Upload to Filestack
+  const uploadResponse = await fetch(`https://www.filestackapi.com/api/store/S3?key=${ocrApiKey}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/pdf',
+    },
+    body: bytes,
+  });
+
+  if (!uploadResponse.ok) {
+    const errorText = await uploadResponse.text();
+    console.error('Filestack upload error:', errorText);
+    throw new Error('Failed to upload PDF to Filestack');
+  }
+
+  const uploadData = await uploadResponse.json();
+  const fileHandle = uploadData.handle;
+  
+  console.log('PDF uploaded to Filestack, handle:', fileHandle);
+
+  // Use Filestack OCR to extract text
+  const ocrResponse = await fetch(`https://cdn.filestackapi.com/output=format:json/${ocrApiKey}/${fileHandle}`);
+  
+  if (!ocrResponse.ok) {
+    const errorText = await ocrResponse.text();
+    console.error('Filestack OCR error:', errorText);
+    throw new Error('Filestack OCR processing failed');
+  }
+
+  const ocrData = await ocrResponse.json();
+  
+  // Extract text from OCR response
+  let extractedText = '';
+  if (ocrData.text) {
+    extractedText = ocrData.text;
+  } else if (ocrData.ocr && ocrData.ocr.text) {
+    extractedText = ocrData.ocr.text;
+  } else if (Array.isArray(ocrData)) {
+    extractedText = ocrData.map((item: any) => item.text || '').join('\n\n');
+  }
+
+  console.log('Filestack OCR extraction complete, text length:', extractedText.length);
+  return extractedText;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -65,69 +165,29 @@ serve(async (req) => {
     console.log('Step 1: Running OCR to extract text from document...');
 
     const lovableApiKey = Deno.env.get('LOVABLE_API_KEY');
+    const ocrApiKey = Deno.env.get('OCR_API_KEY');
+    
     if (!lovableApiKey) {
       throw new Error('LOVABLE_API_KEY not configured');
     }
 
-    // Step 1: OCR - Extract all text from the image/PDF
-    const ocrResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${lovableApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemini-2.5-flash',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are an OCR expert. Extract ALL text from the provided image or PDF document. Preserve the exact formatting, structure, and order of the text. Include question numbers, options, and any other visible text.'
-          },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:${mimeType};base64,${base64}`
-                }
-              },
-              {
-                type: 'text',
-                text: 'Extract all text from this document using OCR. Maintain the original structure and formatting.'
-              }
-            ]
-          }
-        ],
-      }),
-    });
+    const isPdf = filePath.toLowerCase().endsWith('.pdf');
+    let extractedText = '';
 
-    if (!ocrResponse.ok) {
-      const errorText = await ocrResponse.text();
-      console.error('OCR error:', ocrResponse.status, errorText);
-      
-      if (ocrResponse.status === 429) {
-        return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }), {
-          status: 429,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
+    // Step 1: OCR - Extract all text
+    if (isPdf && ocrApiKey) {
+      // Use Filestack OCR for PDF files
+      try {
+        extractedText = await processPdfWithFilestack(base64, ocrApiKey);
+      } catch (error) {
+        console.error('Filestack OCR failed, falling back to Gemini:', error);
+        // Fall back to Gemini if Filestack fails
+        isPdf && (extractedText = await extractWithGemini(base64, mimeType, lovableApiKey));
       }
-      
-      if (ocrResponse.status === 402) {
-        return new Response(JSON.stringify({ error: 'AI credits depleted. Please add funds to continue.' }), {
-          status: 402,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-
-      return new Response(JSON.stringify({ error: 'OCR processing failed' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+    } else {
+      // Use Gemini for images or if Filestack key not configured
+      extractedText = await extractWithGemini(base64, mimeType, lovableApiKey);
     }
-
-    const ocrData = await ocrResponse.json();
-    const extractedText = ocrData.choices[0].message.content;
     
     console.log('OCR extracted text length:', extractedText.length);
     console.log('Step 2: Parsing text to extract MCQs...');
