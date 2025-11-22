@@ -62,14 +62,77 @@ serve(async (req) => {
       ? 'image/jpeg'
       : 'image/png';
 
-    console.log('Extracting questions using AI...');
+    console.log('Step 1: Running OCR to extract text from document...');
 
-    // Call Lovable AI to extract questions
     const lovableApiKey = Deno.env.get('LOVABLE_API_KEY');
     if (!lovableApiKey) {
       throw new Error('LOVABLE_API_KEY not configured');
     }
 
+    // Step 1: OCR - Extract all text from the image/PDF
+    const ocrResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${lovableApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'google/gemini-2.5-flash',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an OCR expert. Extract ALL text from the provided image or PDF document. Preserve the exact formatting, structure, and order of the text. Include question numbers, options, and any other visible text.'
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${mimeType};base64,${base64}`
+                }
+              },
+              {
+                type: 'text',
+                text: 'Extract all text from this document using OCR. Maintain the original structure and formatting.'
+              }
+            ]
+          }
+        ],
+      }),
+    });
+
+    if (!ocrResponse.ok) {
+      const errorText = await ocrResponse.text();
+      console.error('OCR error:', ocrResponse.status, errorText);
+      
+      if (ocrResponse.status === 429) {
+        return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }), {
+          status: 429,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      
+      if (ocrResponse.status === 402) {
+        return new Response(JSON.stringify({ error: 'AI credits depleted. Please add funds to continue.' }), {
+          status: 402,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ error: 'OCR processing failed' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const ocrData = await ocrResponse.json();
+    const extractedText = ocrData.choices[0].message.content;
+    
+    console.log('OCR extracted text length:', extractedText.length);
+    console.log('Step 2: Parsing text to extract MCQs...');
+
+    // Step 2: Parse the extracted text to identify MCQs
     const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -81,7 +144,7 @@ serve(async (req) => {
         messages: [
           {
             role: 'system',
-            content: `You are an expert at extracting exam questions from documents. Extract ALL multiple-choice questions from the provided image or PDF. For each question, provide:
+            content: `You are an expert at parsing exam questions from text. Extract ALL multiple-choice questions from the provided text. For each question, provide:
 1. The question text
 2. Four options (A, B, C, D)
 3. The correct answer (A, B, C, or D)
@@ -100,18 +163,7 @@ Do not include any markdown formatting or explanations, just the raw JSON array.
           },
           {
             role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:${mimeType};base64,${base64}`
-                }
-              },
-              {
-                type: 'text',
-                text: 'Extract all multiple-choice questions from this document.'
-              }
-            ]
+            content: `Here is the OCR-extracted text from an exam document. Parse it and extract all multiple-choice questions:\n\n${extractedText}`
           }
         ],
       }),
@@ -142,15 +194,14 @@ Do not include any markdown formatting or explanations, just the raw JSON array.
     }
 
     const aiData = await aiResponse.json();
-    const extractedText = aiData.choices[0].message.content;
+    const questionsText = aiData.choices[0].message.content;
     
-    console.log('AI response:', extractedText);
+    console.log('AI response:', questionsText);
 
-    // Parse the JSON response
     let questions;
     try {
       // Remove markdown code blocks if present
-      const cleanedText = extractedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const cleanedText = questionsText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       questions = JSON.parse(cleanedText);
     } catch (parseError) {
       console.error('Failed to parse AI response:', parseError);
