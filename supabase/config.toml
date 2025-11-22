@@ -1,0 +1,7 @@
+project_id = "vmsditpqudrvmbxrbowj"
+
+[functions]
+enabled = true
+
+[functions.extract-questions]
+verify_jwt = false
